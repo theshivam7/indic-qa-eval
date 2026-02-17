@@ -27,6 +27,7 @@ uv.lock
 # Generated output (re-created on each run)
 output/
 logs/
+*.partial.csv
 
 # OS
 .DS_Store

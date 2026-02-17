@@ -17,11 +17,16 @@ _rouge_scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 
 
 def normalize_text(text):
-    """Lowercase, strip punctuation, collapse whitespace."""
+    """Normalize text following SQuAD evaluation standard (Rajpurkar et al., 2016).
+
+    Steps: lowercase → remove punctuation → remove articles → collapse whitespace.
+    """
     if not isinstance(text, str):
         text = str(text)
     text = text.lower().strip()
     text = text.translate(str.maketrans("", "", string.punctuation))
+    # Remove articles (standard SQuAD normalization)
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 

@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import logging
+import argparse
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -165,27 +166,76 @@ def call_llm_api(client, model_id, prompt, logger):
 
 
 def run_experiment(client, model_name, model_id, strategy_name, df, logger):
-    """Run a single (model, strategy) experiment. Returns DataFrame with llm_answer column."""
+    """Run a single (model, strategy) experiment with row-level checkpointing.
+
+    Saves each answer incrementally to a .partial.csv file. If interrupted,
+    re-running will resume from the last saved row.
+    """
     prompt_builder = STRATEGY_BUILDERS[strategy_name]
-    llm_answers = []
     total = len(df)
 
+    # Checkpoint path: output/<strategy>/results_<model>.partial.csv
+    safe_model = model_name.replace("/", "_").replace(" ", "_")
+    output_dir = config.STRATEGY_OUTPUT_DIRS[strategy_name]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / f"results_{safe_model}.partial.csv"
+
+    # Resume from checkpoint if it exists and is valid
+    start_row = 0
+    llm_answers = []
+    if checkpoint_path.exists():
+        try:
+            partial_df = pd.read_csv(checkpoint_path)
+            saved_rows = len(partial_df)
+            # Validate: checkpoint must not exceed current dataset size
+            if saved_rows <= total:
+                start_row = saved_rows
+                # Use astype(str) to prevent NaN/float type issues
+                llm_answers = partial_df["llm_answer"].fillna("").astype(str).tolist()
+                logger.info(
+                    "Resuming from checkpoint: %d/%d rows already done.",
+                    start_row, total,
+                )
+            else:
+                logger.warning(
+                    "Stale checkpoint (%d rows) exceeds dataset (%d rows). Starting fresh.",
+                    saved_rows, total,
+                )
+                checkpoint_path.unlink()
+        except Exception as e:
+            logger.warning("Corrupt checkpoint, starting fresh: %s", e)
+            checkpoint_path.unlink()
+
     logger.info(
-        "Starting: model=%s, strategy=%s, rows=%d",
-        model_name, strategy_name, total,
+        "Starting: model=%s, strategy=%s, rows=%d (from row %d)",
+        model_name, strategy_name, total, start_row + 1,
     )
 
-    for row_num, (_, row) in enumerate(df.iterrows(), start=1):
+    for row_num, (_, row) in enumerate(df.iterrows()):
+        if row_num < start_row:
+            continue  # already answered
+
         prompt = prompt_builder(
             str(row["question"]), str(row["context"]), str(row["question_type"])
         )
-        llm_answers.append(call_llm_api(client, model_id, prompt, logger))
+        answer = call_llm_api(client, model_id, prompt, logger)
+        llm_answers.append(answer)
 
-        if row_num % 10 == 0 or row_num == total:
-            logger.info("  Progress: %d/%d", row_num, total)
+        # Save checkpoint after every row
+        checkpoint_df = df.head(len(llm_answers)).copy()
+        checkpoint_df["llm_answer"] = llm_answers
+        checkpoint_df.to_csv(checkpoint_path, index=False)
+
+        if (row_num + 1) % 10 == 0 or row_num + 1 == total:
+            logger.info("  Progress: %d/%d", row_num + 1, total)
 
     results_df = df.copy()
     results_df["llm_answer"] = llm_answers
+
+    # Remove checkpoint after successful completion
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+
     return results_df
 
 
@@ -295,6 +345,20 @@ def print_comparison_table(comparison_df, logger):
 
 def main():
     """Run all experiments and generate the comparison table."""
+    parser = argparse.ArgumentParser(description="ICH QA Evaluation Framework")
+    parser.add_argument(
+        "-n", "--samples", type=int, default=None,
+        help="Number of samples to evaluate (default: all rows)",
+    )
+    parser.add_argument(
+        "-s", "--strategies", nargs="+", default=None,
+        choices=config.PROMPT_STRATEGIES,
+        help="Prompt strategies to run (default: all)",
+    )
+    args = parser.parse_args()
+
+    strategies = args.strategies or config.PROMPT_STRATEGIES
+
     logger = setup_logging()
     logger.info("=" * 80)
     logger.info("ICH QA Evaluation Framework - Starting")
@@ -305,6 +369,9 @@ def main():
 
     try:
         df = load_dataset()
+        if args.samples:
+            df = df.head(args.samples)
+            logger.info("Using first %d samples.", args.samples)
         logger.info(
             "Dataset loaded: %d rows, types: %s",
             len(df), df["question_type"].value_counts().to_dict(),
@@ -317,12 +384,24 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     all_metrics = []
-    total_experiments = len(config.MODELS) * len(config.PROMPT_STRATEGIES)
+    total_experiments = len(config.MODELS) * len(strategies)
     experiment_num = 0
+    comparison_path = config.OUTPUT_DIR / "comparison_table.csv"
 
     for model_name, model_id in config.MODELS.items():
-        for strategy_name in config.PROMPT_STRATEGIES:
+        for strategy_name in strategies:
             experiment_num += 1
+
+            # Skip if final results already exist (fully completed)
+            safe_model = model_name.replace("/", "_").replace(" ", "_")
+            existing_csv = config.STRATEGY_OUTPUT_DIRS[strategy_name] / f"results_{safe_model}.csv"
+            if existing_csv.exists():
+                logger.info(
+                    "Skipping %d/%d (already exists): model=%s, strategy=%s",
+                    experiment_num, total_experiments, model_name, strategy_name,
+                )
+                continue
+
             logger.info("-" * 60)
             logger.info(
                 "Experiment %d/%d: model=%s, strategy=%s",
@@ -330,29 +409,41 @@ def main():
             )
             logger.info("-" * 60)
 
-            results_df = run_experiment(
-                client, model_name, model_id, strategy_name, df, logger
-            )
-            save_experiment_results(results_df, model_name, strategy_name, logger)
+            try:
+                results_df = run_experiment(
+                    client, model_name, model_id, strategy_name, df, logger
+                )
+                save_experiment_results(results_df, model_name, strategy_name, logger)
 
-            logger.info("Computing metrics...")
-            metric_records = compute_metrics_for_results(results_df, logger)
-            save_metric_scores_json(metric_records, model_name, strategy_name, logger)
-            for record in metric_records:
-                record["model"] = model_name
-                record["strategy"] = strategy_name
-                all_metrics.append(record)
+                logger.info("Computing metrics...")
+                metric_records = compute_metrics_for_results(results_df, logger)
+                save_metric_scores_json(metric_records, model_name, strategy_name, logger)
+                for record in metric_records:
+                    record["model"] = model_name
+                    record["strategy"] = strategy_name
+                    all_metrics.append(record)
 
-            logger.info("Completed: model=%s, strategy=%s", model_name, strategy_name)
+                # Save comparison table after each experiment (crash-safe)
+                if all_metrics:
+                    comparison_df = build_comparison_table(all_metrics)
+                    comparison_df.to_csv(comparison_path, index=False)
 
-    logger.info("Building final comparison table...")
-    comparison_df = build_comparison_table(all_metrics)
+                logger.info("Completed: model=%s, strategy=%s", model_name, strategy_name)
 
-    comparison_path = config.OUTPUT_DIR / "comparison_table.csv"
-    comparison_df.to_csv(comparison_path, index=False)
-    logger.info("Comparison table saved to %s", comparison_path)
+            except Exception as e:
+                logger.error(
+                    "Experiment failed (model=%s, strategy=%s): %s",
+                    model_name, strategy_name, e,
+                )
+                logger.info("Continuing with next experiment...")
 
-    print_comparison_table(comparison_df, logger)
+    if all_metrics:
+        comparison_df = build_comparison_table(all_metrics)
+        comparison_df.to_csv(comparison_path, index=False)
+        logger.info("Comparison table saved to %s", comparison_path)
+        print_comparison_table(comparison_df, logger)
+    else:
+        logger.info("No new experiments were run.")
 
     logger.info("=" * 80)
     logger.info("ICH QA Evaluation Framework - Complete")
