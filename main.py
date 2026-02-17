@@ -9,6 +9,7 @@ generates a comparison table.
 import os
 import sys
 import time
+import json
 import logging
 
 import pandas as pd
@@ -229,6 +230,36 @@ def save_experiment_results(results_df, model_name, strategy_name, logger):
     logger.info("Saved results to %s", filepath)
 
 
+def save_metric_scores_json(metric_records, model_name, strategy_name, logger):
+    """Save overall metric scores as a JSON file to output/<strategy>/."""
+    output_dir = config.STRATEGY_OUTPUT_DIRS[strategy_name]
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find the 'overall' record
+    overall = next((r for r in metric_records if r.get("question_type") == "overall"), None)
+    if not overall:
+        return
+
+    scores = {
+        "mean_exact_match": overall["mean_exact_match"],
+        "std_exact_match": overall["std_exact_match"],
+        "mean_f1_score": overall["mean_f1_score"],
+        "std_f1_score": overall["std_f1_score"],
+        "mean_rouge_l": overall["mean_rouge_l"],
+        "std_rouge_l": overall["std_rouge_l"],
+        "mean_bert_score": overall["mean_bert_score"],
+        "std_bert_score": overall["std_bert_score"],
+    }
+
+    safe_model = model_name.replace("/", "_").replace(" ", "_")
+    filepath = output_dir / f"scores_{safe_model}.json"
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(scores, f, indent=2)
+
+    logger.info("Saved scores to %s", filepath)
+
+
 def build_comparison_table(all_metrics):
     """Build a sorted DataFrame from all experiment metrics."""
     comparison_df = pd.DataFrame(all_metrics)
@@ -306,6 +337,7 @@ def main():
 
             logger.info("Computing metrics...")
             metric_records = compute_metrics_for_results(results_df, logger)
+            save_metric_scores_json(metric_records, model_name, strategy_name, logger)
             for record in metric_records:
                 record["model"] = model_name
                 record["strategy"] = strategy_name
