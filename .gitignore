@@ -1,0 +1,36 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# uv
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Generated output (re-created on each run)
+output/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gemini
+.gemini/
