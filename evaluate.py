@@ -9,7 +9,6 @@ from collections import Counter
 
 import numpy as np
 from rouge_score import rouge_scorer
-from bert_score import score as bert_score_fn
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +119,8 @@ def bert_score_value(predictions, references):
     if not predictions:
         return []
     try:
+        from bert_score import score as bert_score_fn
+
         _p, _r, f1 = bert_score_fn(
             predictions, references,
             lang="en", verbose=False, rescale_with_baseline=True,

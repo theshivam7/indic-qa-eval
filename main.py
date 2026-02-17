@@ -122,6 +122,7 @@ def _call_openai_compatible(client, model_id, prompt):
     """Call an OpenAI-compatible API (Together AI, Groq)."""
     response = client.chat.completions.create(
         model=model_id,
+        max_tokens=config.MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
     answer = response.choices[0].message.content
@@ -365,6 +366,15 @@ def main():
     logger.info("=" * 80)
 
     load_dotenv()
+
+    if not config.MODELS:
+        logger.error(
+            "No models configured for API_PROVIDER='%s'. "
+            "Check PROVIDER_MODELS in config.py.",
+            config.API_PROVIDER,
+        )
+        sys.exit(1)
+
     client = build_client(logger)
 
     try:
@@ -392,7 +402,7 @@ def main():
         for strategy_name in strategies:
             experiment_num += 1
 
-            # Skip if final results already exist (fully completed)
+            # Load metrics from existing results if already completed
             safe_model = model_name.replace("/", "_").replace(" ", "_")
             existing_csv = config.STRATEGY_OUTPUT_DIRS[strategy_name] / f"results_{safe_model}.csv"
             if existing_csv.exists():
@@ -400,6 +410,18 @@ def main():
                     "Skipping %d/%d (already exists): model=%s, strategy=%s",
                     experiment_num, total_experiments, model_name, strategy_name,
                 )
+                try:
+                    existing_df = pd.read_csv(existing_csv)
+                    existing_df["llm_answer"] = existing_df["llm_answer"].fillna("").astype(str)
+                    metric_records = compute_metrics_for_results(existing_df, logger)
+                    for record in metric_records:
+                        record["model"] = model_name
+                        record["strategy"] = strategy_name
+                        all_metrics.append(record)
+                except Exception as e:
+                    logger.warning(
+                        "Could not load metrics from existing results: %s", e
+                    )
                 continue
 
             logger.info("-" * 60)

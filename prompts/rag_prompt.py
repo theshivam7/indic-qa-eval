@@ -73,6 +73,7 @@ def build_prompt(question, context, question_type, **kwargs):
         f"or information not present in the context.\n\n"
         f"{type_instruction}\n\n"
         f"Context:\n{retrieved_context}\n\n"
+        f"Question Type: {question_type}\n"
         f"Question: {question}\n\n"
         f"Answer:"
     )
