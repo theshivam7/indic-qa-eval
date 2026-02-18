@@ -2,7 +2,7 @@
 five_shot.py - Five-shot prompt template (5 examples per category).
 """
 
-from prompts.zero_shot import SYSTEM_INSTRUCTION
+from prompts.zero_shot import SYSTEM_INSTRUCTION_WITH_CONTEXT, SYSTEM_INSTRUCTION_NO_CONTEXT
 
 FACTOID_EXAMPLES = """
 Example 1 (Factoid):
@@ -104,12 +104,22 @@ Answer: It fuses Hindu, Islamic, Buddhist, and Christian art and motifs as a sym
 def build_prompt(question, context, question_type, **kwargs):
     """Build a five-shot prompt with 5 examples per category."""
     examples = FACTOID_EXAMPLES + BOOLEAN_EXAMPLES + OTHERS_EXAMPLES
+    if context and context.strip():
+        return (
+            f"{SYSTEM_INSTRUCTION_WITH_CONTEXT}\n\n"
+            f"Here are examples showing the expected answer format:\n"
+            f"{examples}\n"
+            f"Now answer the following:\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question Type: {question_type}\n"
+            f"Question: {question}\n\n"
+            f"Answer:"
+        )
     return (
-        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"{SYSTEM_INSTRUCTION_NO_CONTEXT}\n\n"
         f"Here are examples showing the expected answer format:\n"
         f"{examples}\n"
         f"Now answer the following:\n\n"
-        f"Context:\n{context}\n\n"
         f"Question Type: {question_type}\n"
         f"Question: {question}\n\n"
         f"Answer:"

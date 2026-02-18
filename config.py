@@ -38,8 +38,14 @@ PROVIDER_MODELS = {
 # Active models — automatically selected from the provider above
 MODELS = PROVIDER_MODELS.get(API_PROVIDER, {})
 
-# Max tokens for LLM response (used by Anthropic; Together/Groq use model defaults)
+# LLM generation parameters
 MAX_TOKENS = 1024
+TEMPERATURE = 0.0  # deterministic output for reproducibility
+
+# ── Experiment modes ─────────────────────────────────────────
+# "context"    → question + context + question_type (default)
+# "no_context" → question + question_type only
+VALID_MODES = ["context", "no_context"]
 
 # Prompts
 PROMPT_STRATEGIES = [
@@ -50,7 +56,22 @@ PROMPT_STRATEGIES = [
     "rag",
 ]
 
-STRATEGY_OUTPUT_DIRS = {s: OUTPUT_DIR / s for s in PROMPT_STRATEGIES}
+# RAG is excluded in no_context mode (nothing to retrieve from)
+NO_CONTEXT_STRATEGIES = [s for s in PROMPT_STRATEGIES if s != "rag"]
+
+# Directory names for each mode
+MODE_DIR_NAMES = {
+    "context": "context",
+    "no_context": "no_context",
+}
+
+
+def get_strategy_output_dirs(mode="context"):
+    """Return output dirs for each strategy under the given mode."""
+    mode_dir = OUTPUT_DIR / MODE_DIR_NAMES[mode]
+    strategies = NO_CONTEXT_STRATEGIES if mode == "no_context" else PROMPT_STRATEGIES
+    return {s: mode_dir / s for s in strategies}
+
 
 # Question types (must match the values in the dataset CSV)
 QUESTION_TYPES = ["factual", "boolean", "other"]

@@ -120,31 +120,51 @@ def load_dataset():
 
 def _call_openai_compatible(client, model_id, prompt):
     """Call an OpenAI-compatible API (Together AI, Groq)."""
+    start = time.perf_counter()
     response = client.chat.completions.create(
         model=model_id,
         max_tokens=config.MAX_TOKENS,
+        temperature=config.TEMPERATURE,
         messages=[{"role": "user", "content": prompt}],
     )
+    elapsed = time.perf_counter() - start
     answer = response.choices[0].message.content
-    return answer.strip() if answer else ""
+    usage = response.usage
+    return {
+        "answer": answer.strip() if answer else "",
+        "response_time": round(elapsed, 3),
+        "prompt_tokens": usage.prompt_tokens if usage else 0,
+        "completion_tokens": usage.completion_tokens if usage else 0,
+    }
 
 
 def _call_anthropic(client, model_id, prompt):
     """Call the Anthropic Messages API."""
+    start = time.perf_counter()
     message = client.messages.create(
         model=model_id,
         max_tokens=config.MAX_TOKENS,
+        temperature=config.TEMPERATURE,
         messages=[{"role": "user", "content": prompt}],
     )
-    if not message.content:
-        return ""
-    answer = message.content[0].text
-    return answer.strip() if answer else ""
+    elapsed = time.perf_counter() - start
+    usage = message.usage
+    answer = message.content[0].text if message.content else ""
+    return {
+        "answer": answer.strip() if answer else "",
+        "response_time": round(elapsed, 3),
+        "prompt_tokens": usage.input_tokens if usage else 0,
+        "completion_tokens": usage.output_tokens if usage else 0,
+    }
 
 
 def call_llm_api(client, model_id, prompt, logger):
-    """Call the LLM API with exponential backoff retry."""
+    """Call the LLM API with exponential backoff retry.
+
+    Returns a dict with keys: answer, response_time, prompt_tokens, completion_tokens.
+    """
     is_anthropic = config.API_PROVIDER == "anthropic"
+    empty_result = {"answer": "", "response_time": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
 
     for attempt in range(1, config.MAX_RETRIES + 1):
         try:
@@ -160,13 +180,14 @@ def call_llm_api(client, model_id, prompt, logger):
             )
             if attempt == config.MAX_RETRIES:
                 logger.error("Max retries reached. Returning empty answer.")
-                return ""
+                return empty_result
             time.sleep(wait_time)
 
-    return ""
+    return empty_result
 
 
-def run_experiment(client, model_name, model_id, strategy_name, df, logger):
+def run_experiment(client, model_name, model_id, strategy_name, df,
+                    strategy_output_dirs, logger):
     """Run a single (model, strategy) experiment with row-level checkpointing.
 
     Saves each answer incrementally to a .partial.csv file. If interrupted,
@@ -175,15 +196,18 @@ def run_experiment(client, model_name, model_id, strategy_name, df, logger):
     prompt_builder = STRATEGY_BUILDERS[strategy_name]
     total = len(df)
 
-    # Checkpoint path: output/<strategy>/results_<model>.partial.csv
+    # Checkpoint path: output/<mode>/<strategy>/results_<model>.partial.csv
     safe_model = model_name.replace("/", "_").replace(" ", "_")
-    output_dir = config.STRATEGY_OUTPUT_DIRS[strategy_name]
+    output_dir = strategy_output_dirs[strategy_name]
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / f"results_{safe_model}.partial.csv"
 
     # Resume from checkpoint if it exists and is valid
     start_row = 0
     llm_answers = []
+    response_times = []
+    prompt_tokens_list = []
+    completion_tokens_list = []
     if checkpoint_path.exists():
         try:
             partial_df = pd.read_csv(checkpoint_path)
@@ -193,6 +217,19 @@ def run_experiment(client, model_name, model_id, strategy_name, df, logger):
                 start_row = saved_rows
                 # Use astype(str) to prevent NaN/float type issues
                 llm_answers = partial_df["llm_answer"].fillna("").astype(str).tolist()
+                # Gracefully handle old checkpoints that lack timing/token columns
+                if "response_time" in partial_df.columns:
+                    response_times = partial_df["response_time"].fillna(0.0).tolist()
+                else:
+                    response_times = [0.0] * saved_rows
+                if "prompt_tokens" in partial_df.columns:
+                    prompt_tokens_list = partial_df["prompt_tokens"].fillna(0).astype(int).tolist()
+                else:
+                    prompt_tokens_list = [0] * saved_rows
+                if "completion_tokens" in partial_df.columns:
+                    completion_tokens_list = partial_df["completion_tokens"].fillna(0).astype(int).tolist()
+                else:
+                    completion_tokens_list = [0] * saved_rows
                 logger.info(
                     "Resuming from checkpoint: %d/%d rows already done.",
                     start_row, total,
@@ -219,12 +256,18 @@ def run_experiment(client, model_name, model_id, strategy_name, df, logger):
         prompt = prompt_builder(
             str(row["question"]), str(row["context"]), str(row["question_type"])
         )
-        answer = call_llm_api(client, model_id, prompt, logger)
-        llm_answers.append(answer)
+        result = call_llm_api(client, model_id, prompt, logger)
+        llm_answers.append(result["answer"])
+        response_times.append(result["response_time"])
+        prompt_tokens_list.append(result["prompt_tokens"])
+        completion_tokens_list.append(result["completion_tokens"])
 
         # Save checkpoint after every row
         checkpoint_df = df.head(len(llm_answers)).copy()
         checkpoint_df["llm_answer"] = llm_answers
+        checkpoint_df["response_time"] = response_times
+        checkpoint_df["prompt_tokens"] = prompt_tokens_list
+        checkpoint_df["completion_tokens"] = completion_tokens_list
         checkpoint_df.to_csv(checkpoint_path, index=False)
 
         if (row_num + 1) % 10 == 0 or row_num + 1 == total:
@@ -232,12 +275,22 @@ def run_experiment(client, model_name, model_id, strategy_name, df, logger):
 
     results_df = df.copy()
     results_df["llm_answer"] = llm_answers
+    results_df["response_time"] = response_times
+    results_df["prompt_tokens"] = prompt_tokens_list
+    results_df["completion_tokens"] = completion_tokens_list
 
     # Remove checkpoint after successful completion
     if checkpoint_path.exists():
         checkpoint_path.unlink()
 
     return results_df
+
+
+def _add_timing_token_stats(record, subset_df):
+    """Add response time and token usage stats to a metric record."""
+    record["mean_response_time"] = round(subset_df["response_time"].mean(), 3)
+    record["total_prompt_tokens"] = int(subset_df["prompt_tokens"].sum())
+    record["total_completion_tokens"] = int(subset_df["completion_tokens"].sum())
 
 
 def compute_metrics_for_results(results_df, logger):
@@ -250,6 +303,7 @@ def compute_metrics_for_results(results_df, logger):
         results_df["question_type"].tolist(),
     )
     overall["question_type"] = "overall"
+    _add_timing_token_stats(overall, results_df)
     records.append(overall)
     logger.info("  Overall metrics computed (n=%d)", overall["count"])
 
@@ -263,15 +317,17 @@ def compute_metrics_for_results(results_df, logger):
             subset["question_type"].tolist(),
         )
         qt_metrics["question_type"] = qt
+        _add_timing_token_stats(qt_metrics, subset)
         records.append(qt_metrics)
         logger.info("  Metrics for '%s' (n=%d)", qt, qt_metrics["count"])
 
     return records
 
 
-def save_experiment_results(results_df, model_name, strategy_name, logger):
-    """Save per-row results CSV to output/<strategy>/."""
-    output_dir = config.STRATEGY_OUTPUT_DIRS[strategy_name]
+def save_experiment_results(results_df, model_name, strategy_name,
+                            strategy_output_dirs, logger):
+    """Save per-row results CSV to output/<mode>/<strategy>/."""
+    output_dir = strategy_output_dirs[strategy_name]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     safe_model = model_name.replace("/", "_").replace(" ", "_")
@@ -281,9 +337,10 @@ def save_experiment_results(results_df, model_name, strategy_name, logger):
     logger.info("Saved results to %s", filepath)
 
 
-def save_metric_scores_json(metric_records, model_name, strategy_name, logger):
-    """Save overall metric scores as a JSON file to output/<strategy>/."""
-    output_dir = config.STRATEGY_OUTPUT_DIRS[strategy_name]
+def save_metric_scores_json(metric_records, model_name, strategy_name,
+                            strategy_output_dirs, logger):
+    """Save overall metric scores as a JSON file to output/<mode>/<strategy>/."""
+    output_dir = strategy_output_dirs[strategy_name]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Find the 'overall' record
@@ -300,6 +357,9 @@ def save_metric_scores_json(metric_records, model_name, strategy_name, logger):
         "std_rouge_l": overall["std_rouge_l"],
         "mean_bert_score": overall["mean_bert_score"],
         "std_bert_score": overall["std_bert_score"],
+        "mean_response_time": overall["mean_response_time"],
+        "total_prompt_tokens": overall["total_prompt_tokens"],
+        "total_completion_tokens": overall["total_completion_tokens"],
     }
 
     safe_model = model_name.replace("/", "_").replace(" ", "_")
@@ -321,6 +381,7 @@ def build_comparison_table(all_metrics):
         "mean_f1_score", "std_f1_score",
         "mean_rouge_l", "std_rouge_l",
         "mean_bert_score", "std_bert_score",
+        "mean_response_time", "total_prompt_tokens", "total_completion_tokens",
     ]
     ordered_cols = [c for c in ordered_cols if c in comparison_df.columns]
     return comparison_df[ordered_cols]
@@ -353,16 +414,38 @@ def main():
     )
     parser.add_argument(
         "-s", "--strategies", nargs="+", default=None,
-        choices=config.PROMPT_STRATEGIES,
-        help="Prompt strategies to run (default: all)",
+        help="Prompt strategies to run (default: all for the mode)",
+    )
+    parser.add_argument(
+        "-m", "--mode", choices=config.VALID_MODES, default="context",
+        help="Experiment mode: 'context' (default) or 'no_context'",
     )
     args = parser.parse_args()
 
-    strategies = args.strategies or config.PROMPT_STRATEGIES
+    mode = args.mode
+
+    # Determine strategies for this mode
+    available_strategies = (
+        config.NO_CONTEXT_STRATEGIES if mode == "no_context"
+        else config.PROMPT_STRATEGIES
+    )
+    if args.strategies:
+        invalid = [s for s in args.strategies if s not in available_strategies]
+        if invalid:
+            parser.error(
+                f"Invalid strategies for mode '{mode}': {invalid}. "
+                f"Available: {available_strategies}"
+            )
+        strategies = args.strategies
+    else:
+        strategies = available_strategies
+
+    # Build output dirs for this mode
+    strategy_output_dirs = config.get_strategy_output_dirs(mode)
 
     logger = setup_logging()
     logger.info("=" * 80)
-    logger.info("ICH QA Evaluation Framework - Starting")
+    logger.info("ICH QA Evaluation Framework - Starting (mode=%s)", mode)
     logger.info("=" * 80)
 
     load_dotenv()
@@ -390,38 +473,32 @@ def main():
         logger.error("Failed to load dataset: %s", e)
         sys.exit(1)
 
-    for d in config.STRATEGY_OUTPUT_DIRS.values():
+    # In no_context mode, blank out the context column
+    if mode == "no_context":
+        df["context"] = ""
+        logger.info("Mode=no_context: context column cleared.")
+
+    for d in strategy_output_dirs.values():
         d.mkdir(parents=True, exist_ok=True)
 
     all_metrics = []
     total_experiments = len(config.MODELS) * len(strategies)
     experiment_num = 0
-    comparison_path = config.OUTPUT_DIR / "comparison_table.csv"
+    mode_output_dir = config.OUTPUT_DIR / config.MODE_DIR_NAMES[mode]
+    comparison_path = mode_output_dir / "comparison_table.csv"
 
     for model_name, model_id in config.MODELS.items():
         for strategy_name in strategies:
             experiment_num += 1
 
-            # Load metrics from existing results if already completed
+            # Skip if final results already exist (fully completed)
             safe_model = model_name.replace("/", "_").replace(" ", "_")
-            existing_csv = config.STRATEGY_OUTPUT_DIRS[strategy_name] / f"results_{safe_model}.csv"
+            existing_csv = strategy_output_dirs[strategy_name] / f"results_{safe_model}.csv"
             if existing_csv.exists():
                 logger.info(
                     "Skipping %d/%d (already exists): model=%s, strategy=%s",
                     experiment_num, total_experiments, model_name, strategy_name,
                 )
-                try:
-                    existing_df = pd.read_csv(existing_csv)
-                    existing_df["llm_answer"] = existing_df["llm_answer"].fillna("").astype(str)
-                    metric_records = compute_metrics_for_results(existing_df, logger)
-                    for record in metric_records:
-                        record["model"] = model_name
-                        record["strategy"] = strategy_name
-                        all_metrics.append(record)
-                except Exception as e:
-                    logger.warning(
-                        "Could not load metrics from existing results: %s", e
-                    )
                 continue
 
             logger.info("-" * 60)
@@ -433,13 +510,20 @@ def main():
 
             try:
                 results_df = run_experiment(
-                    client, model_name, model_id, strategy_name, df, logger
+                    client, model_name, model_id, strategy_name, df,
+                    strategy_output_dirs, logger,
                 )
-                save_experiment_results(results_df, model_name, strategy_name, logger)
+                save_experiment_results(
+                    results_df, model_name, strategy_name,
+                    strategy_output_dirs, logger,
+                )
 
                 logger.info("Computing metrics...")
                 metric_records = compute_metrics_for_results(results_df, logger)
-                save_metric_scores_json(metric_records, model_name, strategy_name, logger)
+                save_metric_scores_json(
+                    metric_records, model_name, strategy_name,
+                    strategy_output_dirs, logger,
+                )
                 for record in metric_records:
                     record["model"] = model_name
                     record["strategy"] = strategy_name
@@ -474,3 +558,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

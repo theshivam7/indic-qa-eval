@@ -97,14 +97,25 @@ def f1_score_tokens(prediction, reference, question_type="factual"):
     return 2 * precision * recall / (precision + recall)
 
 
+def _clean_text(text):
+    """Minimal cleaning for metrics that handle their own normalization (ROUGE, BERTScore)."""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.strip()
+
+
 def rouge_l_score(prediction, reference, question_type="factual"):
-    """Compute ROUGE-L F1 score."""
+    """Compute ROUGE-L F1 score.
+
+    Uses minimal cleaning instead of SQuAD normalization — rouge_scorer
+    handles its own tokenization and stemming (Lin, 2004).
+    """
     if question_type == "boolean":
         pred = normalize_boolean(prediction)
         ref = normalize_boolean(reference)
     else:
-        pred = normalize_text(prediction)
-        ref = normalize_text(reference)
+        pred = _clean_text(prediction)
+        ref = _clean_text(reference)
 
     if not pred and not ref:
         return 1.0
@@ -155,15 +166,18 @@ def compute_all_metrics(predictions, references, question_types):
         f1_scores.append(f1_score_tokens(pred, ref, qt))
         rl_scores.append(rouge_l_score(pred, ref, qt))
 
-    # Normalize inputs for BERTScore
+    # Prepare inputs for BERTScore — use extracted text without SQuAD
+    # normalization so contextual embeddings operate on natural language
+    # (Zhang et al., 2020).  Boolean answers are still canonicalized to
+    # "yes"/"no" to handle model output variation.
     bert_preds, bert_refs = [], []
     for pred, ref, qt in zip(extracted_preds, references, question_types):
         if qt == "boolean":
             bert_preds.append(normalize_boolean(pred))
             bert_refs.append(normalize_boolean(ref))
         else:
-            bert_preds.append(normalize_text(pred))
-            bert_refs.append(normalize_text(ref))
+            bert_preds.append(_clean_text(pred))
+            bert_refs.append(_clean_text(ref))
 
     bs_scores = bert_score_value(bert_preds, bert_refs)
 

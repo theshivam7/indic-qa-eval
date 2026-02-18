@@ -2,7 +2,7 @@
 one_shot.py - One-shot prompt template (1 example per category).
 """
 
-from prompts.zero_shot import SYSTEM_INSTRUCTION
+from prompts.zero_shot import SYSTEM_INSTRUCTION_WITH_CONTEXT, SYSTEM_INSTRUCTION_NO_CONTEXT
 
 FACTOID_EXAMPLE = """
 Example (Factoid):
@@ -32,12 +32,22 @@ Answer: Fort Geldria or Fort Geldaria, located in Pulicat, was the seat of the D
 def build_prompt(question, context, question_type, **kwargs):
     """Build a one-shot prompt with 1 example per category."""
     examples = FACTOID_EXAMPLE + BOOLEAN_EXAMPLE + OTHERS_EXAMPLE
+    if context and context.strip():
+        return (
+            f"{SYSTEM_INSTRUCTION_WITH_CONTEXT}\n\n"
+            f"Here are examples showing the expected answer format:\n"
+            f"{examples}\n"
+            f"Now answer the following:\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question Type: {question_type}\n"
+            f"Question: {question}\n\n"
+            f"Answer:"
+        )
     return (
-        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"{SYSTEM_INSTRUCTION_NO_CONTEXT}\n\n"
         f"Here are examples showing the expected answer format:\n"
         f"{examples}\n"
         f"Now answer the following:\n\n"
-        f"Context:\n{context}\n\n"
         f"Question Type: {question_type}\n"
         f"Question: {question}\n\n"
         f"Answer:"

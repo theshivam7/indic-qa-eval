@@ -53,6 +53,7 @@ def retrieve_top_k(question, context, top_k=None):
     bm25 = BM25Okapi(tokenized_chunks)
     scores = bm25.get_scores(question.lower().split())
 
+    # Inner sort: pick top-k by BM25 score; outer sort: restore original document order
     top_indices = sorted(
         sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     )
