@@ -55,7 +55,11 @@ uv sync
 <details>
 <summary>Using pip instead?</summary>
 
+Use a virtual environment to avoid system package conflicts:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
